@@ -1,0 +1,10 @@
+apiVersion: helm.cattle.io/v1
+kind: HelmChart
+metadata:
+  name: cert-manager-webhook-hetzner
+  namespace: kube-system
+spec:
+  repo: "https://charts.hetzner.cloud"
+  chart: "cert-manager-webhook-hetzner"
+  version: "{{ cert_manager_webhook_chart_version }}"
+  targetNamespace: "{{ cert_manager_namespace }}"

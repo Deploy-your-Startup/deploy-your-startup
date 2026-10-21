@@ -1,0 +1,19 @@
+[project]
+name = "deploy-your-startup-role-checks"
+version = "0.0.0"
+requires-python = ">=3.14"
+dependencies = [
+  "ansible==14.4.0",
+  # Runtime requirement of the hetzner.hcloud collection; same pin as the CLI.
+  "hcloud==2.25.1",
+  "playwright==1.63.0",
+  "pytest==9.1.1",
+  "pytest-xdist==3.8.0",
+  "pyyaml==6.0.3",
+]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

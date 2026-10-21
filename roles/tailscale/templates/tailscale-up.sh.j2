@@ -1,0 +1,4 @@
+tailscale up \
+  --auth-key={{ tailscale_join_key | quote }} \
+  --advertise-tags='{{ tailscale_tags | default(["tag:server"]) | join(",") }}' \
+  --hostname='{{ tailscale_node_hostname }}'

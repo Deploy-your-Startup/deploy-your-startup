@@ -1,0 +1,28 @@
+---
+# Default installation method: "helm" or "k3s_helm"
+cert_manager_install_method: "k3s_helm"
+
+cert_manager_chart_version: "v1.21.2"
+
+# Namespace for cert-manager
+cert_manager_namespace: "cert-manager"
+
+# Gateway API version for CRDs
+gateway_api_version: "v1.6.1"
+
+# Where to store temporary manifest files
+cert_manager_tmp_dir: "/tmp"
+
+# Challenge solver: "http01" (default, no token needed) or "dns01" (requires HCLOUD_TOKEN)
+cert_manager_solver: "http01"
+
+# cert-manager is shared by every startup on the cluster, so a project's deploy
+# never re-applies it once it is installed. Set this to true for the one run
+# that is meant to move the cluster to cert_manager_chart_version —
+# `startup ansible cert-manager-upgrade` does exactly that.
+cert_manager_upgrade: false
+
+# Optional ACME contact address owned by the project operator.
+cert_manager_acme_email: ""
+
+cert_manager_webhook_chart_version: "0.9.0"

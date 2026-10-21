@@ -1,0 +1,20 @@
+---
+- name: "Check that k3s is installed"
+  ansible.builtin.stat:
+    path: /etc/rancher/k3s/k3s.yaml
+  register: kubernetes_client_kubeconfig
+
+- name: "Require infrastructure setup before deploying services"
+  ansible.builtin.fail:
+    msg: >-
+      k3s is not installed on this host. Run `startup ansible infrastructure`
+      once before deploying services.
+  when: not kubernetes_client_kubeconfig.stat.exists
+
+- name: "Prepare kubeconfig for the Kubernetes Ansible modules"
+  ansible.builtin.include_role:
+    name: prepare-kubeconfig
+
+- name: "Prepare the isolated Kubernetes Python client"
+  ansible.builtin.import_role:
+    name: python

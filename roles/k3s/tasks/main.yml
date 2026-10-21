@@ -1,0 +1,428 @@
+# -----------------------------------------------------------------------------
+# STEP 1: Get network info directly from server
+# -----------------------------------------------------------------------------
+- name: "Get private IP"
+  ansible.builtin.shell: ip -o addr show | grep -v -E 'flannel|cni|veth|docker' | grep -E "inet 10\.[0-9]+\.[0-9]+\.[0-9]+" | awk '{print $4}' | cut -d'/' -f1 | head -1
+  register: private_ip_result
+  changed_when: false
+
+- name: "Set node IP (private if available, otherwise public)"
+  ansible.builtin.set_fact:
+    node_private_ip: "{{ private_ip_result.stdout | default('', true) }}"
+    has_private_network: "{{ private_ip_result.stdout | default('', true) | length > 0 }}"
+
+- name: "Get flannel interface"
+  ansible.builtin.shell: ip -o addr show | grep "{{ node_private_ip }}" | awk '{print $2}'
+  register: flannel_iface_result
+  changed_when: false
+  when: has_private_network
+
+- name: "Set flannel interface"
+  ansible.builtin.set_fact:
+    flannel_interface: "{{ flannel_iface_result.stdout | default('') }}"
+  when: has_private_network
+
+# -----------------------------------------------------------------------------
+# STEP 2: Determine role from hostname
+# -----------------------------------------------------------------------------
+- name: "Set node role"
+  ansible.builtin.set_fact:
+    is_first_master: "{{ inventory_hostname.endswith('master-0') }}"
+    is_master: "{{ 'master' in inventory_hostname }}"
+    is_worker: "{{ 'worker' in inventory_hostname }}"
+    first_master_host: "{{ inventory_hostname | regex_replace('(master|worker)-[0-9]+$', 'master-0') }}"
+
+- name: "Debug"
+  ansible.builtin.debug:
+    msg: "{{ inventory_hostname }} | private_ip: {{ node_private_ip | default('none', true) }} | api_ip: {{ first_master_ip | default(ansible_host, true) }} | first_master: {{ is_first_master }} | master: {{ is_master }} | worker: {{ is_worker }}"
+
+# -----------------------------------------------------------------------------
+# STEP 2b: Refuse to join a private-network cluster over the public IP
+#
+# Falling back to the public address is correct for a cluster that has no
+# private network at all, but silently wrong when the rest of the cluster is on
+# 10.x — the node joins and reports Ready while its traffic takes a different
+# path. That failure is invisible until you compare INTERNAL-IPs, so catch it
+# here.
+# -----------------------------------------------------------------------------
+- name: "Check whether the first master uses a private network"
+  ansible.builtin.shell: ip -o addr show | grep -v -E 'flannel|cni|veth|docker' | grep -cE "inet 10\.[0-9]+\.[0-9]+\.[0-9]+"
+  register: first_master_private
+  delegate_to: "{{ first_master_host }}"
+  changed_when: false
+  failed_when: false
+
+- name: "Fail on inconsistent private networking"
+  ansible.builtin.fail:
+    msg: |
+      {{ inventory_hostname }} has no private network address, but
+      {{ first_master_host }} does. Joining now would place this node on its
+      public IP while the rest of the cluster talks over 10.x.
+
+      Usually the server was attached to the network after it had already
+      booted, so the interface was never configured. Reboot the node, or
+      recreate it so it is attached at creation time.
+  when:
+    - not has_private_network
+    - (first_master_private.stdout | default('0') | trim | int) > 0
+
+# -----------------------------------------------------------------------------
+# STEP 3: Get first master IP
+# -----------------------------------------------------------------------------
+- name: "Get first master private IP"
+  ansible.builtin.shell: ip -o addr show | grep -v -E 'flannel|cni|veth|docker' | grep -E "inet 10\.[0-9]+\.[0-9]+\.[0-9]+" | awk '{print $4}' | cut -d'/' -f1 | head -1
+  register: first_master_ip_result
+  delegate_to: "{{ first_master_host }}"
+  changed_when: false
+  when: has_private_network
+
+- name: "Set first master IP"
+  ansible.builtin.set_fact:
+    first_master_ip: "{{ first_master_ip_result.stdout if has_private_network else hostvars[first_master_host]['ansible_host'] }}"
+
+# -----------------------------------------------------------------------------
+# STEP 3b: Compose this node's k3s exec args, once.
+#
+# The install script rewrites the systemd unit from INSTALL_K3S_EXEC on every
+# run — it does not merge with what is already there. An upgrade that omits
+# these flags would silently drop --node-ip/--flannel-iface/--tls-san and
+# --node-label, so install and upgrade must pass byte-identical args. Hence one
+# definition, used by both.
+# -----------------------------------------------------------------------------
+- name: "Compose private network flags"
+  ansible.builtin.set_fact:
+    k3s_private_flags_server: "{{ ('--node-ip=' ~ node_private_ip ~ ' --flannel-iface=' ~ flannel_interface ~ ' --tls-san=' ~ node_private_ip) if has_private_network else '' }}"
+    k3s_private_flags_agent: "{{ ('--node-ip=' ~ node_private_ip ~ ' --flannel-iface=' ~ flannel_interface) if has_private_network else '' }}"
+
+- name: "Compose k3s exec args"
+  # --tls-san uses the public IP even when ansible_host is something else. In
+  # private network mode ansible_host becomes the node's MagicDNS name, and
+  # following it here would change the composed args of every existing node —
+  # which the upgrade preflight below rightly treats as drift. The API is
+  # reached over the tailnet with tls-server-name instead (see the CLI's
+  # kubeconfig command), so the certificate does not need the tailnet name.
+  vars:
+    k3s_api_san: "{{ hcloud_ipv4 | default(ansible_host, true) }}"
+  ansible.builtin.set_fact:
+    k3s_node_exec: >-
+      {%- if is_first_master -%}
+      server --cluster-init {{ k3s_private_flags_server }} --tls-san={{ k3s_api_san }} --node-label=type=master
+      {%- elif is_master -%}
+      server --server=https://{{ first_master_ip }}:6443 {{ k3s_private_flags_server }} --tls-san={{ k3s_api_san }} --node-label=type=master
+      {%- else -%}
+      agent {{ k3s_private_flags_agent }} --node-label=type=worker
+      {%- endif -%}
+    k3s_service_name: "{{ 'k3s' if is_master else 'k3s-agent' }}"
+
+# -----------------------------------------------------------------------------
+# STEP 3c: What is already installed here?
+#
+# Every install/join task below is gated on this. Without it the join tasks
+# re-run the installer on every play, silently upgrading a running node
+# whenever k3s_version changed — and taking it down mid-play to do so.
+# -----------------------------------------------------------------------------
+- name: "Read installed k3s version"
+  ansible.builtin.shell: k3s --version 2>/dev/null | awk '/^k3s version/ {print $3}'
+  register: installed_k3s_version
+  changed_when: false
+  failed_when: false
+
+- name: "Set version facts"
+  ansible.builtin.set_fact:
+    k3s_installed_version: "{{ installed_k3s_version.stdout | default('', true) | trim }}"
+    k3s_is_installed: "{{ (installed_k3s_version.stdout | default('', true) | trim) | length > 0 }}"
+
+- name: "Set upgrade fact"
+  ansible.builtin.set_fact:
+    k3s_needs_upgrade: "{{ k3s_is_installed and k3s_installed_version != k3s_version }}"
+
+- name: "Report pending upgrade"
+  ansible.builtin.debug:
+    msg: >-
+      {{ inventory_hostname }} runs {{ k3s_installed_version }}, target is
+      {{ k3s_version }}. Not touching it — run k3s-upgrade-playbook.yml
+      (or pass k3s_upgrade=true) to upgrade this node.
+  when: k3s_needs_upgrade and not (k3s_upgrade | bool)
+
+# -----------------------------------------------------------------------------
+# STEP 4: First master - preflight + cluster init
+# -----------------------------------------------------------------------------
+- name: "Check existing k3s data"
+  ansible.builtin.stat:
+    path: /var/lib/rancher/k3s/server/db
+  register: existing_k3s_db
+  when: is_first_master
+
+- name: "Check existing k3s service"
+  ansible.builtin.shell: systemctl is-active --quiet k3s
+  register: existing_k3s_service
+  failed_when: false
+  changed_when: false
+  when: is_first_master and existing_k3s_db.stat.exists
+
+- name: "Fail on stale k3s data"
+  ansible.builtin.fail:
+    msg: |
+      Existing k3s data was found on this server, but the k3s API is not ready.
+
+      This usually means the VPS was already used for another bootstrap/run and
+      the local datastore is encrypted with a different k3s token. Reusing it
+      would fail with:
+        bootstrap data already found and encrypted with different token
+
+      Use a fresh VPS, or explicitly reset k3s state on this server before
+      running infrastructure again.
+  when:
+    - is_first_master
+    - existing_k3s_db.stat.exists
+    - existing_k3s_service is defined
+    - existing_k3s_service.rc != 0
+
+- name: "Install first master (cluster-init)"
+  ansible.builtin.shell: |
+    set -o pipefail
+    curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION="{{ k3s_version }}" INSTALL_K3S_EXEC="{{ k3s_node_exec }}" sh -
+  args:
+    executable: /bin/bash
+  environment:
+    K3S_TOKEN: "{{ k3s_token }}"
+  no_log: true
+  register: first_master_install
+  changed_when: "'No change' not in first_master_install.stderr"
+  when: is_first_master and not k3s_is_installed and not existing_k3s_db.stat.exists
+
+- name: "Wait for first master API"
+  block:
+    - name: "Wait for first master API"
+      ansible.builtin.wait_for:
+        host: "127.0.0.1"
+        port: 6443
+        timeout: 180
+  rescue:
+    - name: "Show k3s service status"
+      ansible.builtin.shell: systemctl status k3s --no-pager || true
+      register: k3s_status
+      changed_when: false
+
+    - name: "Show recent k3s logs"
+      ansible.builtin.shell: journalctl -u k3s --no-pager -n 120 || true
+      register: k3s_logs
+      changed_when: false
+
+    - name: "Fail with k3s diagnostics"
+      ansible.builtin.fail:
+        msg: |
+          k3s API did not become ready on 127.0.0.1:6443.
+
+          systemctl status k3s:
+          {{ k3s_status.stdout }}
+
+          recent k3s logs:
+          {{ k3s_logs.stdout }}
+  when: is_first_master
+
+# -----------------------------------------------------------------------------
+# STEP 5: Other masters - join
+# -----------------------------------------------------------------------------
+- name: "Wait for first master API"
+  ansible.builtin.wait_for:
+    host: "{{ first_master_ip }}"
+    port: 6443
+    timeout: 180
+  when: is_master and not is_first_master
+
+- name: "Join master"
+  ansible.builtin.shell: |
+    set -o pipefail
+    curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION="{{ k3s_version }}" INSTALL_K3S_EXEC="{{ k3s_node_exec }}" sh -
+  args:
+    executable: /bin/bash
+  environment:
+    K3S_TOKEN: "{{ k3s_token }}"
+  no_log: true
+  register: join_master_install
+  changed_when: "'No change' not in join_master_install.stderr"
+  when: is_master and not is_first_master and not k3s_is_installed
+
+# -----------------------------------------------------------------------------
+# STEP 6: Workers - join
+# -----------------------------------------------------------------------------
+- name: "Wait for master API"
+  ansible.builtin.wait_for:
+    host: "{{ first_master_ip }}"
+    port: 6443
+    timeout: 180
+  when: is_worker
+
+- name: "Join worker"
+  ansible.builtin.shell: |
+    set -o pipefail
+    curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION="{{ k3s_version }}" K3S_URL="https://{{ first_master_ip }}:6443" INSTALL_K3S_EXEC="{{ k3s_node_exec }}" sh -
+  args:
+    executable: /bin/bash
+  environment:
+    K3S_TOKEN: "{{ k3s_token }}"
+  no_log: true
+  register: join_worker_install
+  changed_when: "'No change' not in join_worker_install.stderr"
+  when: is_worker and not k3s_is_installed
+
+# -----------------------------------------------------------------------------
+# STEP 7: Upgrade an already-installed node
+#
+# Opt-in via k3s_upgrade. Ordering across nodes (control plane before workers)
+# is the playbook's job — see k3s-upgrade-playbook.yml.
+# -----------------------------------------------------------------------------
+- name: "Upgrade k3s"
+  when: k3s_needs_upgrade and (k3s_upgrade | bool)
+  block:
+    - name: "Read exec args from the running unit"
+      ansible.builtin.shell: |
+        systemctl cat {{ k3s_service_name }} \
+          | sed -n '/^ExecStart=/,/^$/p' \
+          | sed 's|^ExecStart=[^ ]*/k3s||' \
+          | tr -d "\\\\'" \
+          | tr '\n\t' '  ' \
+          | tr -s ' ' \
+          | sed 's/^ *//; s/ *$//'
+      register: current_exec
+      changed_when: false
+
+    - name: "Refuse to rewrite the unit with different flags"
+      # The installer regenerates the systemd unit from INSTALL_K3S_EXEC on
+      # every run, so an upgrade silently applies whatever the role composes.
+      # If that does not match what the node runs today, something drifted —
+      # stop rather than quietly drop --node-ip/--tls-san and break networking.
+      ansible.builtin.fail:
+        msg: |
+          Composed k3s exec args do not match the running unit on
+          {{ inventory_hostname }}. Upgrading would rewrite the systemd unit
+          and apply the difference.
+
+          running:  {{ current_exec.stdout }}
+          composed: {{ k3s_node_exec | regex_replace('\s+', ' ') | trim }}
+
+          Reconcile the role with the node, or re-run with
+          -e k3s_force_exec=true if the composed args are the correct ones.
+      when:
+        - current_exec.stdout != (k3s_node_exec | regex_replace('\s+', ' ') | trim)
+        - not (k3s_force_exec | default(false) | bool)
+
+    - name: "Read the token the node already runs with"
+      # Not from group_vars: a shared playbook lives in .shared-roles/, where
+      # Ansible finds no group_vars at all, so k3s_token is simply undefined
+      # there. The node's own token is the correct source anyway — it is what
+      # the running service uses.
+      ansible.builtin.shell: |
+        sed -n 's/^K3S_TOKEN=//p' /etc/systemd/system/{{ k3s_service_name }}.service.env \
+          | sed "s/^'//; s/'$//"
+      register: node_k3s_token
+      changed_when: false
+      no_log: true
+
+    - name: "Fail if no token could be read"
+      ansible.builtin.fail:
+        msg: >-
+          Could not read K3S_TOKEN from
+          /etc/systemd/system/{{ k3s_service_name }}.service.env on
+          {{ inventory_hostname }}. Re-running the installer without it would
+          rewrite that file and strip the node's token.
+      when: node_k3s_token.stdout | length == 0
+
+    - name: "Take etcd snapshot before upgrading"
+      ansible.builtin.shell: k3s etcd-snapshot save --name pre-upgrade-{{ k3s_version | regex_replace('[^a-zA-Z0-9]', '-') }}
+      register: pre_upgrade_snapshot
+      when: is_master
+      changed_when: true
+
+    - name: "Count cluster nodes"
+      ansible.builtin.shell: k3s kubectl get nodes --no-headers | wc -l
+      delegate_to: "{{ first_master_host }}"
+      register: cluster_node_count
+      changed_when: false
+
+    - name: "Drain node"
+      # Pointless on a single-node cluster: there is nowhere to move the pods,
+      # and draining would just evict everything for the duration of a restart
+      # that the pods would otherwise survive.
+      ansible.builtin.shell: >-
+        k3s kubectl drain {{ inventory_hostname }}
+        --ignore-daemonsets --delete-emptydir-data --force --timeout=300s
+      delegate_to: "{{ first_master_host }}"
+      when: cluster_node_count.stdout | int > 1
+      changed_when: true
+
+    - name: "Run installer with target version"
+      # The token goes through `environment`, not the command line, so it
+      # cannot surface in a failure message or a verbose task dump.
+      ansible.builtin.shell: |
+        set -o pipefail
+        curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION="{{ k3s_version }}" {% if is_worker %}K3S_URL="https://{{ first_master_ip }}:6443" {% endif %}INSTALL_K3S_EXEC="{{ k3s_node_exec }}" sh -
+      args:
+        executable: /bin/bash
+      environment:
+        K3S_TOKEN: "{{ node_k3s_token.stdout }}"
+      no_log: true
+      register: k3s_upgrade_install
+      changed_when: true
+
+    - name: "Wait for the API to come back"
+      # Masters only. On a worker this port belongs to the master and says
+      # nothing about the agent — there the Ready check below is the real
+      # signal.
+      ansible.builtin.wait_for:
+        host: "127.0.0.1"
+        port: 6443
+        timeout: "{{ k3s_upgrade_ready_timeout }}"
+      when: is_master
+
+    - name: "Wait for node to report Ready on the new version"
+      ansible.builtin.shell: >-
+        k3s kubectl get node {{ inventory_hostname }}
+        -o jsonpath='{.status.nodeInfo.kubeletVersion}{" "}{range .status.conditions[?(@.type=="Ready")]}{.status}{end}'
+      delegate_to: "{{ first_master_host }}"
+      register: node_ready_check
+      until: node_ready_check.stdout == k3s_version ~ " True"
+      retries: "{{ (k3s_upgrade_ready_timeout | int / 10) | int }}"
+      delay: 10
+      changed_when: false
+
+    - name: "Uncordon node"
+      ansible.builtin.shell: k3s kubectl uncordon {{ inventory_hostname }}
+      delegate_to: "{{ first_master_host }}"
+      when: cluster_node_count.stdout | int > 1
+      changed_when: true
+
+    - name: "Report upgrade"
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }}: {{ k3s_installed_version }} -> {{ k3s_version }}"
+
+  rescue:
+    - name: "Show k3s logs after failed upgrade"
+      ansible.builtin.shell: journalctl -u {{ k3s_service_name }} --no-pager -n 30 || true
+      register: upgrade_failure_logs
+      changed_when: false
+
+    - name: "Fail with upgrade diagnostics"
+      # Lead with the original failure. A rescue block replaces the real error
+      # with whatever it reports, so anything not repeated here is lost — and a
+      # wall of journal output is no substitute for the message that actually
+      # says what went wrong.
+      ansible.builtin.fail:
+        msg: |
+          Upgrading {{ inventory_hostname }} from {{ k3s_installed_version }}
+          to {{ k3s_version }} failed at: {{ ansible_failed_task.name }}
+
+          error:  {{ '(sensitive task output hidden)' if ansible_failed_result._ansible_no_log | default(false) else ansible_failed_result.msg | default('(none)') }}
+          stdout: {{ '(hidden)' if ansible_failed_result._ansible_no_log | default(false) else ansible_failed_result.stdout | default('(none)') }}
+          stderr: {{ '(hidden)' if ansible_failed_result._ansible_no_log | default(false) else ansible_failed_result.stderr | default('(none)') }}
+
+          The node may be cordoned; check with
+          `kubectl get node {{ inventory_hostname }}`.
+          {% if is_master %}
+          An etcd snapshot was taken before the upgrade; list it with
+          `k3s etcd-snapshot ls` and restore with
+          `k3s server --cluster-reset --cluster-reset-restore-path=<snapshot>`.
+          {% endif %}
+          last {{ k3s_service_name }} log lines:
+          {{ upgrade_failure_logs.stdout }}

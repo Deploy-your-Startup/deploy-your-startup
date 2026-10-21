@@ -1,0 +1,82 @@
+name: Export shared Ansible roles
+description: Copy shared Ansible roles and assets into a target directory
+inputs:
+  destination:
+    description: Destination directory for shared roles
+    required: false
+    default: .shared-roles
+  _pin-resolved:
+    description: Internal recursion guard for immutable action dispatch
+    required: false
+    default: "false"
+runs:
+  using: composite
+  steps:
+    - name: Resolve the reviewed runtime action
+      if: ${{ inputs._pin-resolved != 'true' && hashFiles('deployment/shared-roles.ref') != '' }}
+      shell: bash
+      env:
+        STARTUP_ACTION_REPOSITORY: ${{ github.action_repository || github.repository }}
+      run: python3 "${{ github.action_path }}/../../scripts/resolve-pinned-action.py" export-shared-roles
+
+    - name: Execute the reviewed runtime action
+      if: ${{ inputs._pin-resolved != 'true' && hashFiles('deployment/shared-roles.ref') != '' }}
+      uses: ./deployment/.startup-pinned-export-shared-roles
+      env:
+        STARTUP_PIN_DESTINATION: ${{ inputs.destination }}
+
+    - name: Export shared roles
+      if: ${{ inputs._pin-resolved == 'true' || hashFiles('deployment/shared-roles.ref') == '' }}
+      shell: bash
+      env:
+        ACTION_REPO_ROOT: ${{ github.action_path }}
+        DESTINATION_DIR: ${{ inputs.destination }}
+      run: |
+        set -euo pipefail
+        source_root="$(cd "$ACTION_REPO_ROOT/../../.." && pwd)"
+        destination="$GITHUB_WORKSPACE/$DESTINATION_DIR"
+
+        rm -rf "$destination"
+        mkdir -p "$destination"
+
+        cp -R "$source_root/roles" "$destination/roles"
+
+        if [ -f "$source_root/ansible.cfg" ]; then
+          cp "$source_root/ansible.cfg" "$destination/ansible.cfg"
+        fi
+
+        if [ -f "$source_root/requirements.yml" ]; then
+          cp "$source_root/requirements.yml" "$destination/requirements.yml"
+        fi
+
+        if [ -f "$source_root/inventory.ini" ]; then
+          cp "$source_root/inventory.ini" "$destination/inventory.ini"
+        fi
+
+        if [ -f "$source_root/inventory.hcloud.yml" ]; then
+          cp "$source_root/inventory.hcloud.yml" "$destination/inventory.hcloud.yml"
+        fi
+
+        if [ -f "$source_root/backup-playbook.yml" ]; then
+          cp "$source_root/backup-playbook.yml" "$destination/backup-playbook.yml"
+        fi
+
+        if [ -f "$source_root/os-upgrade-playbook.yml" ]; then
+          cp "$source_root/os-upgrade-playbook.yml" "$destination/os-upgrade-playbook.yml"
+        fi
+
+        if [ -f "$source_root/restore-playbook.yml" ]; then
+          cp "$source_root/restore-playbook.yml" "$destination/restore-playbook.yml"
+        fi
+
+        if [ -f "$source_root/update-vms-playbook.yml" ]; then
+          cp "$source_root/update-vms-playbook.yml" "$destination/update-vms-playbook.yml"
+        fi
+
+        if [ -f "$source_root/k3s-upgrade-playbook.yml" ]; then
+          cp "$source_root/k3s-upgrade-playbook.yml" "$destination/k3s-upgrade-playbook.yml"
+        fi
+
+        if [ -f "$source_root/dns-playbook.yml" ]; then
+          cp "$source_root/dns-playbook.yml" "$destination/dns-playbook.yml"
+        fi

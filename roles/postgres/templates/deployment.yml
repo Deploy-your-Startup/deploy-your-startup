@@ -1,0 +1,62 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres
+  namespace: "{{ k8s_namespace | default('default') }}"
+  labels:
+    app: postgres
+spec:
+  selector:
+    matchLabels:
+      app: postgres
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchFields:
+                  - key: metadata.name
+                    operator: In
+                    values: ["{{ postgres_selected_node }}"]
+      containers:
+      - image: "postgres:{{ postgres_version }}"
+        name: postgres
+        imagePullPolicy: IfNotPresent
+        env:
+        - name: POSTGRES_USER
+          valueFrom:
+            secretKeyRef:
+              name: postgres
+              key: admin_username
+        - name: POSTGRES_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: postgres
+              key: admin_password
+        - name: PGDATA
+          value: /var/lib/postgresql/data/pgdata
+        startupProbe:
+          exec:
+            command: [sh, -c, 'pg_isready -U "$POSTGRES_USER"']
+          periodSeconds: 5
+          failureThreshold: 60
+        readinessProbe:
+          exec:
+            command: [sh, -c, 'pg_isready -U "$POSTGRES_USER"']
+          periodSeconds: 5
+        ports:
+        - containerPort: 5432
+          name: postgres
+        volumeMounts:
+        - name: postgres-persistent-storage
+          mountPath: /var/lib/postgresql/data
+      volumes:
+      - name: postgres-persistent-storage
+        persistentVolumeClaim:
+          claimName: postgres

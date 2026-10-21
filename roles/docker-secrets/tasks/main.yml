@@ -1,0 +1,7 @@
+- name: "apply docker secrets"
+  kubernetes.core.k8s:
+    state: present
+    definition: "{{ lookup('template', 'docker-secret.yml') }}"
+  no_log: true
+  diff: false
+  tags: docker-secrets

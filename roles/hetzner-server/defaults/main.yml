@@ -1,0 +1,45 @@
+---
+# Fallback server type, used for any node type without its own setting.
+server_type: cx23
+
+# Per-node-type overrides. Set these in a project's group_vars when masters and
+# workers should differ — a small worker next to a bigger control plane, or an
+# arm64 fleet where the fallback above does not apply:
+#
+#   master_server_type: cax11
+#   worker_server_type: cax21
+#
+# The role resolves `<node_type>_server_type` and falls back to `server_type`.
+# Nothing is set here so existing projects keep their current behaviour.
+
+node_type: master
+node_count: 1
+location: fsn1
+
+# OS image for newly created servers. Override in a project's group_vars to put
+# new nodes on a different Ubuntu than the fleet default:
+#
+#   hetzner_os_image: ubuntu-26.04
+#
+# This only takes effect at creation. Hetzner's server API takes the image when
+# the server is built, so bumping this does NOT upgrade any existing node — it
+# stays on whatever it was created with, and the two drift apart silently. An
+# in-place release upgrade is a separate operation; this value only decides what
+# the *next* server comes up with.
+hetzner_os_image: ubuntu-24.04
+
+# Escape hatches, both off by default. Each guards an operation that is fine
+# when you mean it and destructive when it happens as a side effect of a
+# routine `infrastructure` run:
+#
+#   allow_master_teardown: lowering master_count deletes control-plane nodes
+#   allow_server_resize:   changing *_server_type stops a running server to
+#                          resize it, and leaves it stopped if Hetzner rejects
+#                          the change
+#
+# Pass them per run (`-e allow_server_resize=true`), not in group_vars.
+allow_master_teardown: false
+allow_server_resize: false
+
+# Required for any worker deletion, including failed provisioning cleanup.
+allow_worker_teardown: false

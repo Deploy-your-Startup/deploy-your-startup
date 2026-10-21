@@ -1,0 +1,86 @@
+name: Container E2E
+on:
+  workflow_call:
+    inputs:
+      directory:
+        type: string
+        default: e2e_tests
+      shards:
+        type: number
+        default: 1
+      runtime_revision:
+        description: "Shared CI runtime resolved by the application workflow"
+        type: string
+        default: ''
+      artifact_prefix:
+        type: string
+        default: e2e
+permissions:
+  contents: read
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.matrix.outputs.value }}
+    steps:
+      - id: matrix
+        name: Validate shard count
+        env:
+          SHARDS: ${{ inputs.shards }}
+        run: |
+          python3 - <<'PYTHON'
+          import json, os
+          count = int(os.environ["SHARDS"])
+          if not 1 <= count <= 8:
+              raise SystemExit("shards must be an integer between 1 and 8")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write("value=" + json.dumps(list(range(1, count + 1))) + "\n")
+          PYTHON
+  test:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - uses: Deploy-your-Startup/deploy-your-startup/.github/actions/pin-ci-runtime@main
+        if: inputs.runtime_revision != ''
+        with:
+          revision: ${{ inputs.runtime_revision }}
+      - name: Build cached browser image on this runner
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ${{ inputs.directory }}/Dockerfile
+          tags: startup-e2e:${{ github.run_id }}
+          load: true
+          cache-from: type=gha,scope=${{ inputs.artifact_prefix }}-e2e
+          cache-to: type=gha,mode=max,scope=${{ inputs.artifact_prefix }}-e2e
+      - name: Run pinned isolated browser shard
+        if: inputs.runtime_revision != ''
+        uses: ./.git/startup-actions/container-e2e
+        with:
+          directory: ${{ inputs.directory }}
+          image: startup-e2e:${{ github.run_id }}
+          shard: ${{ matrix.shard }}
+          total: ${{ inputs.shards }}
+      - name: Run isolated browser shard
+        if: inputs.runtime_revision == ''
+        uses: Deploy-your-Startup/deploy-your-startup/.github/actions/container-e2e@main
+        with:
+          directory: ${{ inputs.directory }}
+          image: startup-e2e:${{ github.run_id }}
+          shard: ${{ matrix.shard }}
+          total: ${{ inputs.shards }}
+      - name: Preserve reports and failure diagnostics
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ inputs.artifact_prefix }}-e2e-shard-${{ matrix.shard }}
+          path: ${{ runner.temp }}/e2e-reports/
+          if-no-files-found: error
+          retention-days: 7

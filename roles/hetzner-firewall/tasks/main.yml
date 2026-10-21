@@ -1,0 +1,140 @@
+---
+# =============================================================================
+# HETZNER FIREWALL CONFIGURATION
+# =============================================================================
+# Simple rules:
+# - HTTP/HTTPS public; SSH/API use separately configured administration CIDRs
+# - Everything else only from the private network
+#
+# network_mode: private closes the public ports. The cluster is then reachable
+# only through the tailnet: Tailscale traffic arrives on the tailscale0
+# interface and is never seen by the Hetzner firewall. Only UDP 41641 stays
+# open so devices connect directly instead of through a DERP relay.
+# =============================================================================
+
+- name: "Check the network mode"
+  ansible.builtin.assert:
+    that:
+      - (network_mode | default('public')) in ['public', 'private']
+    fail_msg: "network_mode must be 'public' or 'private', got '{{ network_mode | default('public') }}'"
+
+- name: "Refuse a load balancer in private network mode"
+  # A Hetzner load balancer is a public endpoint of its own. Cloud firewalls do
+  # not apply to it, so it would keep the site reachable from the internet no
+  # matter what the rules below say.
+  ansible.builtin.assert:
+    that:
+      - not (create_load_balancer | default(false) | bool)
+    fail_msg: >-
+      network_mode: private cannot be combined with create_load_balancer: true —
+      the load balancer would stay publicly reachable. Set create_load_balancer
+      to false (and delete the existing load balancer) first.
+  when: (network_mode | default('public')) == 'private'
+
+- name: "Get all project servers"
+  hetzner.hcloud.server_info:
+  register: hcloud_servers
+
+- name: "Extract server IPs"
+  ansible.builtin.set_fact:
+    cluster_server_ips: >-
+      {{ hcloud_servers.hcloud_server_info 
+         | selectattr('name', 'match', project_name + '-.*') 
+         | map(attribute='ipv4_address') 
+         | map('regex_replace', '^(.*)$', '\1/32')
+         | list }}
+
+- name: "Create Hetzner Firewall"
+  hetzner.hcloud.firewall:
+    name: "{{ firewall_name }}"
+    state: present
+    rules: >-
+      {{ (firewall_private_rules if (network_mode | default('public')) == 'private' else firewall_public_rules)
+         + firewall_cluster_rules }}
+  vars:
+    firewall_public_rules: >-
+      {{ firewall_web_rules
+         + (firewall_ssh_rules if firewall_ssh_source_ips | length > 0 else [])
+         + (firewall_api_rules if firewall_api_source_ips | length > 0 else []) }}
+    firewall_web_rules:
+      - direction: in
+        protocol: tcp
+        port: "80"
+        source_ips: ["0.0.0.0/0", "::/0"]
+        description: "HTTP"
+      - direction: in
+        protocol: tcp
+        port: "443"
+        source_ips: ["0.0.0.0/0", "::/0"]
+        description: "HTTPS"
+    firewall_ssh_rules:
+      - direction: in
+        protocol: tcp
+        port: "22"
+        source_ips: "{{ firewall_ssh_source_ips }}"
+        description: "SSH administration"
+    firewall_api_rules:
+      - direction: in
+        protocol: tcp
+        port: "6443"
+        source_ips: "{{ firewall_api_source_ips }}"
+        description: "Kubernetes API administration"
+
+    firewall_private_rules:
+      - direction: in
+        protocol: udp
+        port: "41641"
+        source_ips:
+          - 0.0.0.0/0
+          - ::/0
+        description: "Tailscale direct connections"
+
+    firewall_cluster_rules:
+      # --- PRIVATE NETWORK ACCESS (Cluster-intern) ---
+      - direction: in
+        protocol: tcp
+        port: any
+        source_ips:
+          - "{{ network_ip_range }}"
+        description: "All TCP from private network"
+
+      - direction: in
+        protocol: udp
+        port: any
+        source_ips:
+          - "{{ network_ip_range }}"
+        description: "All UDP from private network"
+
+      - direction: in
+        protocol: icmp
+        source_ips:
+          - "{{ network_ip_range }}"
+        description: "ICMP from private network"
+
+      # --- CLUSTER NODES (Public IP Fallback) ---
+      - direction: in
+        protocol: tcp
+        port: any
+        source_ips: "{{ cluster_server_ips }}"
+        description: "All TCP from cluster nodes"
+
+      - direction: in
+        protocol: udp
+        port: any
+        source_ips: "{{ cluster_server_ips }}"
+        description: "All UDP from cluster nodes"
+
+- name: "Get server names for firewall"
+  ansible.builtin.set_fact:
+    firewall_servers: >-
+      {{ groups['all'] 
+         | select('match', project_name + '-.*') 
+         | list }}
+
+- name: "Apply firewall to servers"
+  hetzner.hcloud.firewall_resource:
+    firewall: "{{ firewall_name }}"
+    servers:
+      - "{{ item }}"
+    state: present
+  loop: "{{ firewall_servers }}"

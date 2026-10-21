@@ -1,0 +1,253 @@
+---
+- name: "Add public ssh keys"
+  hetzner.hcloud.ssh_key:
+    name: "{{ item.name }}"
+    public_key: "{{ item.key }}"
+    state: present
+  tags: infrastructure
+  loop: "{{ ssh_public_keys }}"
+
+- name: "Resolve server type for this node type"
+  # `<node_type>_server_type` wins over the generic `server_type`, so masters
+  # and workers can differ in size or architecture. The role is imported once
+  # per node type, so this resolves separately for each pass.
+  ansible.builtin.set_fact:
+    node_server_type: "{{ lookup('vars', node_type ~ '_server_type', default=server_type) }}"
+  tags: infrastructure
+
+# -----------------------------------------------------------------------------
+# Preflight: never resize a running server as a side effect.
+#
+# The create task below runs with `force: true`, which is what lets the module
+# apply a server_type change — by stopping the machine, resizing it, and
+# starting it again. When the change is rejected (a different architecture, or
+# a type the disk cannot shrink into) the server stays off. A group_vars value
+# that no longer matches reality therefore takes production down, and does it
+# during a routine `infrastructure` run.
+#
+# Checking first turns that from a mistake you have to remember not to make
+# into one the play refuses to carry out.
+# -----------------------------------------------------------------------------
+- name: "List existing {{ node_type }} servers before creating"
+  hetzner.hcloud.server_info:
+    label_selector: "type={{ node_type }}"
+  register: preflight_nodes
+  tags: infrastructure
+
+- name: "Refuse to change the type of a running {{ node_type }}"
+  ansible.builtin.fail:
+    msg: |
+      {{ mismatched_nodes | map(attribute='name') | join(', ') }} would be
+      changed to {{ node_server_type }}:
+
+      {% for node in mismatched_nodes %}
+        {{ node.name }}: {{ node.server_type }} -> {{ node_server_type }}
+      {% endfor %}
+
+      The create task runs with force: true, so this run would stop the
+      server to resize it — and leave it stopped if Hetzner rejects the
+      change (a different architecture, or a disk that cannot shrink).
+
+      Either correct {{ node_type }}_server_type / server_type to what the
+      server actually is, or — if the resize is what you want — stop the
+      server first and re-run, or pass -e allow_server_resize=true.
+  vars:
+    wanted_node_names: >-
+      {{ range(0, node_count | int)
+         | map('regex_replace', '^(.*)$', project_name ~ '-' ~ node_type ~ '-\1')
+         | list }}
+    # Only nodes this run would actually touch. Anything outside node_count is
+    # surplus and gets deleted further down, so its type is irrelevant.
+    mismatched_nodes: >-
+      {{ preflight_nodes.hcloud_server_info
+         | selectattr('name', 'in', wanted_node_names)
+         | selectattr('status', 'equalto', 'running')
+         | rejectattr('server_type', 'equalto', node_server_type)
+         | list }}
+  when:
+    - mismatched_nodes | length > 0
+    - not (allow_server_resize | default(false) | bool)
+  tags: infrastructure
+
+- name: "Initialize per-server Tailscale join keys"
+  ansible.builtin.set_fact:
+    tailscale_boot_keys: {}
+  no_log: true
+  tags: infrastructure
+
+- name: "Generate join keys only for new private servers"
+  ansible.builtin.include_tasks:
+    file: mint-join-key.yml
+    apply:
+      tags: infrastructure
+  loop: "{{ range(0, node_count | int) | list }}"
+  vars:
+    tailscale_new_server_name: "{{ project_name }}-{{ node_type }}-{{ item }}"
+  when:
+    - tailscale_enabled | default((network_mode | default('public')) == 'private') | bool
+    - tailscale_new_server_name not in (preflight_nodes.hcloud_server_info | map(attribute='name') | list)
+    - not ansible_check_mode
+  tags: infrastructure
+
+- name: "Create Hetzner Server"
+  hetzner.hcloud.server:
+    location: "{{ location }}"
+    force: true
+    # network=private is what switches the inventory to the tailnet address
+    # (inventory.hcloud.yml). Public projects keep exactly the labels they had,
+    # so this is no diff for them.
+    labels: >-
+      {{ {'type': node_type, 'ingress': 'true'}
+         | combine({'network': 'private'} if (network_mode | default('public')) == 'private' else {}) }}
+    name: "{{ server_name }}"
+    server_type: "{{ node_server_type }}"
+    ssh_keys: "{{ ssh_public_keys | map(attribute='name') | list }}"
+    image: "{{ hetzner_os_image }}"
+    # Only read by Hetzner when the server is created, so existing servers are
+    # untouched; they join via the tailscale role instead. A new private server
+    # has to be on the tailnet before Ansible can reach it at all.
+    user_data: >-
+      {{ lookup('template', 'cloud-init-tailscale.yml.j2') if (tailscale_on_boot | bool and server_name in tailscale_boot_keys) else omit }}
+    # Attach at creation, not afterwards. A server attached to a network only
+    # after it has booted does not get the interface configured until it is
+    # rebooted — k3s then finds no 10.x address and silently joins on the
+    # public IP. Creating it attached means the interface exists from first
+    # boot. For servers that already exist this is a diff, so an unchanged
+    # network list is a no-op.
+    private_networks: ["{{ network_name }}"]
+    state: present
+  loop: "{{ range(0, node_count) | list }}"  # Startet bei 0!
+  vars:
+    server_name: "{{ project_name }}-{{ node_type }}-{{ item }}"
+    tailscale_on_boot: >-
+      {{ tailscale_enabled | default((network_mode | default('public')) == 'private') }}
+  no_log: "{{ tailscale_on_boot | bool }}"
+  diff: false
+  register: created_servers
+  tags: infrastructure
+
+- name: "Attach server to private network"
+  hetzner.hcloud.server_network:
+    network: "{{ network_name }}"
+    server: "{{ project_name }}-{{ node_type }}-{{ item }}"
+    state: present
+  loop: "{{ range(0, node_count) | list }}"  # Startet bei 0!
+  tags: infrastructure
+
+- name: "Refresh inventory after adding machines"
+  ansible.builtin.meta: refresh_inventory
+  tags: infrastructure
+
+# -----------------------------------------------------------------------------
+# Scale down: anything beyond node_count goes away again.
+#
+# Servers are created as <project>-<type>-0..N-1, so the desired set is fully
+# determined by node_count. Whatever matches the naming scheme but is not in
+# that set is surplus — that is what makes `worker_count: 0` actually tear the
+# worker down instead of leaving it running and unmanaged.
+# -----------------------------------------------------------------------------
+- name: "List existing {{ node_type }} servers"
+  hetzner.hcloud.server_info:
+    label_selector: "type={{ node_type }}"
+  register: existing_nodes
+  tags: infrastructure
+
+- name: "Determine surplus nodes"
+  ansible.builtin.set_fact:
+    surplus_nodes: >-
+      {{ existing_nodes.hcloud_server_info
+         | map(attribute='name')
+         | select('match', '^' ~ project_name ~ '-' ~ node_type ~ '-[0-9]+$')
+         | reject('in', wanted_node_names)
+         | list }}
+  vars:
+    wanted_node_names: >-
+      {{ range(0, node_count | int)
+         | map('regex_replace', '^(.*)$', project_name ~ '-' ~ node_type ~ '-\1')
+         | list }}
+  tags: infrastructure
+
+- name: "Refuse to tear down control-plane nodes"
+  # Removing a master means removing an etcd member. That is a deliberate,
+  # quorum-sensitive operation, not something a lowered master_count should
+  # trigger as a side effect.
+  ansible.builtin.fail:
+    msg: |
+      master_count={{ node_count }} would remove: {{ surplus_nodes | join(', ') }}
+
+      Tearing down control-plane nodes is not automated — it removes etcd
+      members and can break quorum. Remove the member manually
+      (`k3s etcd-snapshot save`, then `kubectl delete node`, then delete the
+      server), or re-run with -e allow_master_teardown=true if you are sure.
+  when:
+    - node_type == 'master'
+    - surplus_nodes | length > 0
+    - not (allow_master_teardown | default(false) | bool)
+  tags: infrastructure
+
+- name: "Require explicit authorization to remove workers"
+  ansible.builtin.assert:
+    that:
+      - allow_worker_teardown | default(false) | bool
+    fail_msg: >-
+      worker_count={{ node_count }} would delete {{ surplus_nodes | join(', ') }}.
+      Review the nodes and their data, then re-run with
+      `startup ansible infrastructure --allow-worker-teardown` if removal is intended.
+  when:
+    - node_type == 'worker'
+    - surplus_nodes | length > 0
+  tags: infrastructure
+
+- name: "Require the first master before removing cluster nodes"
+  ansible.builtin.assert:
+    that:
+      - (project_name ~ '-master-0') in hostvars
+    fail_msg: >-
+      The first master is unavailable. No surplus server was deleted.
+      Restore access to the cluster before scaling down.
+  when: surplus_nodes | length > 0
+  tags: infrastructure
+
+- name: "Drain surplus nodes before deleting servers"
+  ansible.builtin.command:
+    argv:
+      - k3s
+      - kubectl
+      - drain
+      - "{{ item }}"
+      - --ignore-daemonsets
+      - --timeout=300s
+  delegate_to: "{{ project_name }}-master-0"
+  connection: ssh
+  loop: "{{ surplus_nodes }}"
+  changed_when: true
+  tags: infrastructure
+
+- name: "Remove drained nodes from the cluster"
+  ansible.builtin.command:
+    argv:
+      - k3s
+      - kubectl
+      - delete
+      - node
+      - "{{ item }}"
+      - --ignore-not-found=true
+  delegate_to: "{{ project_name }}-master-0"
+  connection: ssh
+  loop: "{{ surplus_nodes }}"
+  changed_when: true
+  tags: infrastructure
+
+- name: "Delete surplus servers"
+  hetzner.hcloud.server:
+    name: "{{ item }}"
+    state: absent
+  loop: "{{ surplus_nodes }}"
+  tags: infrastructure
+
+- name: "Refresh inventory after removing machines"
+  # No `when:` — meta tasks silently ignore conditionals (Ansible only warns),
+  # so guarding this would be a lie. Refreshing unconditionally is correct
+  # anyway; it is what the create path above already does.
+  ansible.builtin.meta: refresh_inventory
+  tags: infrastructure

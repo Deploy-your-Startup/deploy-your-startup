@@ -1,0 +1,107 @@
+---
+- name: "Require the DNS-01 solver in private network mode"
+  # HTTP-01 has Let's Encrypt fetch a token from port 80 of the host, which
+  # private network mode closes to the internet. DNS-01 proves ownership through
+  # a TXT record instead and works for hosts nobody outside can reach.
+  ansible.builtin.assert:
+    that:
+      - cert_manager_solver == "dns01"
+    fail_msg: >-
+      network_mode: private needs cert_manager_solver: dns01 (currently
+      '{{ cert_manager_solver }}') — HTTP-01 challenges cannot reach the cluster.
+  when: (network_mode | default('public')) == 'private'
+  tags: cert-manager
+
+# cert-manager is cluster-wide, but this role runs once per project. On a shared
+# cluster the second startup's deploy would otherwise re-apply the HelmChart with
+# whatever version *it* pins, flipping the cluster back and forth between
+# releases on every deploy. Same rule the k3s role already follows: report the
+# drift, do not act on it unless someone opts in.
+- name: "Look up the installed cert-manager release"
+  kubernetes.core.k8s_info:
+    api_version: helm.cattle.io/v1
+    kind: HelmChart
+    namespace: kube-system
+    name: cert-manager
+  register: cert_manager_release
+  tags: cert-manager
+
+- name: "Look up the installed Hetzner webhook release"
+  kubernetes.core.k8s_info:
+    api_version: helm.cattle.io/v1
+    kind: HelmChart
+    namespace: kube-system
+    name: cert-manager-webhook-hetzner
+  register: cert_manager_webhook_release
+  when: cert_manager_solver == "dns01"
+  tags: cert-manager
+
+- name: "Decide whether this run owns the cluster-wide install"
+  ansible.builtin.set_fact:
+    cert_manager_installed_version: "{{ (cert_manager_release.resources | first).spec.version | default('', true) }}"
+    cert_manager_present: "{{ cert_manager_release.resources | length > 0 }}"
+    cert_manager_webhook_present: >-
+      {{ (cert_manager_webhook_release.resources | default([]) | length) > 0 }}
+  tags: cert-manager
+
+- name: "Report a cert-manager version this run will not apply"
+  ansible.builtin.debug:
+    msg: >-
+      Cluster runs cert-manager {{ cert_manager_installed_version | default('(unknown)', true) }},
+      this project pins {{ cert_manager_chart_version }}. Leaving it alone —
+      cert-manager is shared by every startup on this cluster. Once you have
+      checked the other projects, run
+      `startup ansible cert-manager-upgrade --environment <env>`.
+  when:
+    - cert_manager_present
+    - cert_manager_installed_version != cert_manager_chart_version
+    - not (cert_manager_upgrade | bool)
+  tags: cert-manager
+
+- name: "Set the cluster-wide install flag"
+  ansible.builtin.set_fact:
+    # Install when nothing is there yet, or when an upgrade was explicitly asked
+    # for. A matching version needs no re-apply.
+    cert_manager_install_cluster_wide: >-
+      {{ (not cert_manager_present) or (cert_manager_upgrade | bool) }}
+  tags: cert-manager
+
+- name: Require the owner to install or upgrade shared cluster components
+  ansible.builtin.assert:
+    that:
+      - cert_manager_present
+      - not (cert_manager_upgrade | bool)
+      - cert_manager_solver != 'dns01' or cert_manager_webhook_present
+    fail_msg: Install or upgrade cert-manager and its DNS webhook from the cluster owner first.
+  when: not (startup_cluster_managed | default(true) | bool)
+  tags: cert-manager
+
+# Traefik in current k3s owns these CRDs. Do not overwrite them with a
+# separately downloaded manifest when installing or upgrading cert-manager.
+- name: "Check whether Gateway API CRDs are already managed by the cluster"
+  kubernetes.core.k8s_info:
+    api_version: apiextensions.k8s.io/v1
+    kind: CustomResourceDefinition
+    name: "{{ item }}"
+  loop:
+    - gatewayclasses.gateway.networking.k8s.io
+    - gateways.gateway.networking.k8s.io
+    - httproutes.gateway.networking.k8s.io
+  register: cert_manager_gateway_crds
+  tags: cert-manager
+
+- name: "Count existing Gateway API CRDs"
+  ansible.builtin.set_fact:
+    cert_manager_gateway_crd_count: >-
+      {{ cert_manager_gateway_crds.results | map(attribute='resources') | flatten | length }}
+  tags: cert-manager
+
+- name: "Refuse to overwrite a partially installed Gateway API"
+  ansible.builtin.assert:
+    that:
+      - cert_manager_gateway_crd_count in [0, 3]
+      - startup_cluster_managed | default(true) | bool or cert_manager_gateway_crd_count == 3
+    fail_msg: >-
+      Gateway API is partially installed. Finish the cluster's CRD installation
+      before deploying cert-manager; existing CRDs were not overwritten.
+  tags: cert-manager
