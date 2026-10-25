@@ -16,7 +16,8 @@ while keeping ownership and room to grow.
 
 Part of [Deploy Your Startup](https://deploy-your-startup.com). For your first
 application, follow the [CLI quickstart](https://github.com/Deploy-your-Startup/cli#your-first-startup).
-Contributor conventions live in [AGENTS.md](AGENTS.md).
+Contributor conventions live in [AGENTS.md](AGENTS.md); lasting design
+decisions are recorded in [docs/adr](docs/adr/README.md).
 
 ## Available Workflows
 
@@ -46,6 +47,23 @@ deployment. Pull requests never publish or deploy. The production image is
 exported as an OCI archive and published after the gate without rebuilding it.
 Build caches are scoped per service and target.
 
+Verification and publication use separate concurrency groups. A new automatic
+run cancels superseded verification for the same workflow, ref, environment and
+application, without interrupting publication already in progress. Only
+publication waits for the application/environment lock; it covers the entire
+service matrix, including image publication and deployment. Manual verification
+runs independently and publication shares the same application lock across refs.
+After acquiring that lock, a push skips publication if a newer push to the same
+workflow and branch exists. This also prevents an older rerun from rolling back
+a newer push. A failed newer push requires a fix or an explicit manual redeploy;
+an older automatic run does not take its place. Freshness API failures block
+publication. Already-started publication finishes even if another push arrives.
+
+The public workflow and inputs remain the same. Required checks now appear under
+`verify / Required checks`; update any branch rules that require the old job
+name when adopting this revision. See [deployment scheduling](docs/deployment-scheduling.md)
+for adoption and verification limits.
+
 For an application with several services, supply `service: app` (the workflow's
 concurrency/artifact prefix) and `services` as a JSON array, for example
 `[{"service":"backend"},{"service":"frontend","run_tests":false,"require_coverage":false}]`.
@@ -53,6 +71,9 @@ Each entry inherits the common inputs and may override its test, lint, coverage,
 platform and additional-context settings. All services build in parallel; one
 browser suite gates publication of all of them. This avoids rebuilding and
 rerunning the same browser suite separately for frontend and backend changes.
+
+Run all tests locally. `run_e2e: false` skips the additional CI browser
+run; `run_e2e: true` enables it. Dependabot PRs always run E2E in CI. See the [testing decision](docs/adr/0005-local-or-ci-e2e.md).
 
 The E2E directory supplies two small files:
 
@@ -73,11 +94,25 @@ return nonzero on failure. Use one worker per shard until tests support multiple
 isolated databases. E2E artifacts are separate from integration coverage; their
 percentages are not added or averaged.
 
+When the project command runs multiple test suites, distribute each suite
+explicitly: forward the shard selection to every shardable suite, or assign
+whole suites to specific shards. Running an unsharded secondary suite on every
+runner duplicates work. Keep the default single shard until measured elapsed
+time and total runner minutes justify additional isolated stacks.
+
 Include application, E2E, Docker context and workflow paths in the caller's
 triggers. For multi-service applications, every deployable service must wait
 for the E2E gate; a separate unconnected E2E workflow does not block deployment.
 
 See the [E2E execution guide](docs/e2e-execution.md) for triggers, skips and direct deployment exceptions.
+
+### Container E2E
+- **File**: `.github/workflows/container-e2e.yml`
+- **Type**: Reusable workflow (`workflow_call`)
+- **Features**:
+  - Runs the same `Dockerfile`/`compose.yml` harness without a production build
+  - Used by callers that deploy elsewhere, such as Cloudflare Pages; make the
+    deploy job depend on it
 
 ### Deployment
 - **File**: `.github/workflows/deploy.yml`
@@ -128,7 +163,10 @@ See the [E2E execution guide](docs/e2e-execution.md) for triggers, skips and dir
 - **Location**: `.github/actions/export-shared-roles/action.yml`
 - **Purpose**: Copy the bundled shared roles into `deployment/.shared-roles`
 - **Features**:
-  - Exports `roles/`, `requirements.yml`, `backup-playbook.yml`, and `restore-playbook.yml`
+  - Exports `roles/`, `ansible.cfg`, `requirements.yml`, both inventories and
+    the shared playbooks (`backup-`, `restore-`, `update-vms-`, `os-upgrade-`,
+    `k3s-upgrade-` and `dns-playbook.yml`)
+  - Uses the project's pinned `shared-roles.ref` commit when it exists
   - Keeps CI secret-free for shared roles access
 
 ### Docker Test Action
@@ -173,6 +211,17 @@ there is no separate bundled Docker build/push action.
   - Repository checkout
   - Environment preparation
 
+### Internal actions of the parallel workflow
+
+These are called by `build-and-deploy-service-parallel.yml`; projects do not
+call them directly.
+
+- `pin-ci-runtime`: resolves the immutable revision of the calling reusable
+  workflow and loads the shared test, coverage and browser actions from it
+- `verified-build`: records, selects and restores PR build evidence; see
+  [verified PR builds](docs/verified-pr-builds.md)
+- `container-e2e`: runs one E2E shard in its own Compose project
+
 ## Service Requirements
 
 For a service to work with these workflows, it needs to include:
@@ -183,10 +232,13 @@ For a service to work with these workflows, it needs to include:
 
 2. **make.sh** script with the following commands:
    - `test` command when `run_tests: true`
+   - `coverage` command when `require_coverage: true` (see
+     [Coverage harness contract](#coverage-harness-contract))
    - `lint` command when `run_lint: true` (checks only, no changes)
    - `format` command for local formatting and fixes
    - `run` command for starting the service
-   - The script must be executable and located at the root of the service directory
+   - The script must be executable, use `set -e` and be located at the root of
+     the service directory
 
 Example minimal Dockerfile structure:
 ```dockerfile
@@ -246,9 +298,18 @@ run `startup sync` again after the upstream change is available, then let
 `deployment/.shared-roles`.
 
 The `§§deploy_your_startup.*§§` placeholders below are rendered by sync. In a
-project workflow, replace them with your GitHub owner and shared repository name.
+project workflow, replace them with your GitHub owner and shared repository name,
+and `<commit-sha>` with a reviewed commit of that repository. Avoid `@main`: a
+moving reference changes production CI without review. See
+[releasing and pinning](docs/releasing.md).
 Enable `run_lint` only after the service implements `./make.sh lint`; it defaults
 to false. Caller workflows need a `pull_request` trigger for checks before merge.
+With `run_lint`, the workflow also runs `startup lint-contract` from the CLI
+pinned in `deployment/pyproject.toml`. It fails on a `make.sh` without `set -e`,
+`lint` without `format`, `uvx` calls, missing `.python-version`, an unpinned
+ty, Django without `django-stubs`, `uv`/`python` in `mise.toml`, Git hooks, or
+a service workflow without `pull_request` and `run_lint`. Older CLI pins only
+warn; update the pin to enforce the contract.
 
 To use these workflows in your projects, reference them in your repository's workflow files:
 
@@ -271,7 +332,7 @@ on:
 
 jobs:
   build-and-deploy:
-    uses: Deploy-your-Startup/deploy-your-startup/.github/workflows/build-and-deploy-service.yml@main
+    uses: Deploy-your-Startup/deploy-your-startup/.github/workflows/build-and-deploy-service.yml@<commit-sha>
     with:
       service: frontend
       environment: production
@@ -307,7 +368,7 @@ jobs:
   
   deploy:
     needs: pre-deploy
-    uses: Deploy-your-Startup/deploy-your-startup/.github/workflows/deploy.yml@main
+    uses: Deploy-your-Startup/deploy-your-startup/.github/workflows/deploy.yml@<commit-sha>
     with:
       environment: production
     secrets:
@@ -324,7 +385,7 @@ on:
 
 jobs:
   deploy-infrastructure:
-    uses: Deploy-your-Startup/deploy-your-startup/.github/workflows/deploy-infrastructure.yml@main
+    uses: Deploy-your-Startup/deploy-your-startup/.github/workflows/deploy-infrastructure.yml@<commit-sha>
     with:
       environment: production
     secrets:
@@ -332,7 +393,7 @@ jobs:
       
   deploy-services:
     needs: deploy-infrastructure
-    uses: Deploy-your-Startup/deploy-your-startup/.github/workflows/build-and-deploy-service.yml@main
+    uses: Deploy-your-Startup/deploy-your-startup/.github/workflows/build-and-deploy-service.yml@<commit-sha>
     with:
       service: backend
       environment: production
@@ -345,7 +406,12 @@ jobs:
 The following secrets need to be configured in your repository:
 
 - `GITHUB_TOKEN`: Automatically provided by GitHub, used for container registry authentication
-- `VAULT_PASSWORD`: Required for accessing deployment secrets in Ansible vault
+- `VAULT_PASSWORD`: Required for accessing deployment secrets in Ansible vault.
+  The workflows pass it to the CLI as the `STARTUP_VAULT_PASSWORD` environment
+  variable; the CLI reads it from there or, locally, from macOS Keychain.
+- `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`: only for `deploy-pages.yml`
+
+All other deployment secrets stay in the project's Ansible Vault.
 
 ## Project Structure Requirements
 
@@ -459,6 +525,24 @@ the tailnet, and the new one would join as `<name>-1`. The `tailscale` role
 fails on that instead of letting the inventory reach the dead device — remove the
 old device in the admin console.
 
+## Backup and restore
+
+`backup-playbook.yml` and `restore-playbook.yml` run from `.shared-roles/`
+through the CLI:
+
+```bash
+startup ansible backup --working-directory deployment --environment production
+startup ansible restore --help
+```
+
+Backup writes the database dump and media archive to
+`~/Backups/<project>/<timestamp>/` on the operator's machine with owner-only
+permissions. Restore selects the latest matching artifacts unless
+`--backup-dir`, `--db-file` or `--media-file` choose them, and requires `--yes`.
+Back up every startup on a cluster, attached ones included, before `update-vms`,
+k3s or OS upgrades. Verify a restore into a disposable database before relying
+on a backup.
+
 ## Dependabot Configuration
 
 Dependabot updates GitHub Actions in this repository weekly. Application
@@ -485,6 +569,9 @@ remains part of the current deployment contract, so this is for mutually trusted
 applications under one operator. Local Postgres and media volumes are not highly
 available; back up each startup separately before cluster maintenance.
 
+The guards that keep routine runs from damaging servers, data or DNS are listed
+in [operational safeguards](docs/operational-safeguards.md).
+
 ## Ubuntu LTS release upgrades
 
 The shared `os-upgrade-playbook.yml` and `os-upgrade` role support
@@ -510,18 +597,12 @@ also qualify a real disposable k3s deployment, including release availability,
 SSH/reboot recovery, storage, networking and application HTTPS checks. Local
 integration success alone is not live release compatibility.
 
-### Immutable runtime in Actions
+## Immutable runtime in Actions
 
-When `deployment/shared-roles.ref` exists, deployment and runtime export execute
-the shared action at that exact owner-repository commit. Advancing the shared
-repository's `main` does not replace a project's reviewed roles. The CLI still
-checks `shared-roles.sha256` before Ansible runs. Projects without a pin retain
-the action's current runtime. Review a new pin before adopting role changes.
-
-For projects pinned before the complete standalone exporter was introduced,
-choose a reviewed owner-repository revision containing that exporter before
-adding the standalone pre-deploy checksum check. A runtime-equivalent commit
-can change the action implementation while leaving the role checksum unchanged.
+When `deployment/shared-roles.ref` exists, deployment and role export run the
+shared action at that exact owner-repository commit, and the CLI checks
+`shared-roles.sha256` before Ansible runs. See
+[releasing and pinning](docs/releasing.md).
 
 ## Coverage harness contract
 
@@ -542,19 +623,8 @@ The reporter does not infer test types from Cobertura or the report title.
 Only label suites whose execution contributed to the coverage data. A combined
 report measures the union of covered code, not the sum of suite percentages.
 
-This is a tested service contract, not an architecture decision.
+## Contributing
 
-### KPI access integration and browser checks
-
-With Docker running, install the pinned test dependencies and browser once:
-
-```bash
-uv sync --locked
-uv run --locked playwright install --only-shell chromium
-mise run check
-```
-
-The KPI checks use the actual Umami/Postgres images, OAuth2 Proxy and Traefik.
-A local OIDC provider replaces the external identity-provider boundary. They
-cover session reuse, direct login, anonymous/forged-header denial, public
-collection, read-only permissions and switching back to password access.
+Run `mise run check` with Docker available. The checks, including the KPI
+browser checks against real Umami, OAuth2 Proxy and Traefik images, are
+described in [checking shared roles](docs/role-checks.md).
